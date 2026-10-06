@@ -49,6 +49,7 @@ export type FailureCode =
   | 'busy' // 安装仍在进行，不能退回
   | 'missing' // 上一版缓存或元数据缺失
   | 'stale' // 退回确认迟到，激活代际已被其他标签页切换
+  | 'locked' // 锁定演练仍在进行：再装/退回需要第三份手册缓存
   | 'unknown';
 
 export const FAILURE_TEXT: Record<FailureCode, string> = {
@@ -59,6 +60,8 @@ export const FAILURE_TEXT: Record<FailureCode, string> = {
   busy: '安装仍在进行，不能退回版本；当前可用版本保持不变',
   missing: '上一版完整缓存缺失，不能退回；当前可用版本保持不变',
   stale: '退回确认已过期：另一标签页已完成切换，未覆盖新代际',
+  locked:
+    '锁定演练仍在进行：该操作需要第三份手册缓存，已拒绝（不会删除演练正在使用的版本）',
   unknown: '发生未知错误',
 };
 
@@ -90,6 +93,40 @@ export interface PersistedState {
     mode: InstallMode;
     startedAt: number;
   } | null;
+  /**
+   * 锁定演练会话（可选）：开始演练时把“当前代际 + 版本 + 故障条目”固定到演练会话。
+   * 锁定期间允许安装新版（普通步骤页切到新版），但该演练的资源读取、动作次序与通过记录
+   * 始终指向锁定缓存；再次安装/退回若需要第三份手册缓存则被明确拒绝。
+   * 完成或取消演练才释放；刷新后从 IDB 恢复同一份绑定（含动作进度与通过记录）。
+   */
+  drillLock: DrillLock | null;
+}
+
+/** 锁定演练的通过记录快照（不含手册正文：标题在恢复时由锁定版条目按 entryId 还原）。 */
+export interface DrillPassSnapshot {
+  version: string;
+  entryId: string;
+  totalActions: number;
+  passedAt: number;
+  code: string;
+}
+
+/** 锁定演练会话与某一已核验代际缓存的绑定，同时承载刷新后可恢复的演练进度。 */
+export interface DrillLock {
+  /** 会话标识（同一次刷新恢复保持不变；完成/取消后新会话使用新 ID）。 */
+  sessionId: string;
+  version: string;
+  cacheName: string;
+  generation: string;
+  /** 锁定会话固定的故障条目 ID；资源读取与动作次序均以锁定版的该条目为准。 */
+  faultId: string;
+  /** 已依序勾选到第几步（0..actions.length）。 */
+  checkedUpTo: number;
+  /** 是否已通过；通过后会话停留在此状态，直到用户完成释放。 */
+  passed: boolean;
+  /** 本会话产生的、与锁定版绑定的通过记录（刷新后恢复）。 */
+  records: DrillPassSnapshot[];
+  startedAt: number;
 }
 
 export const INITIAL_PERSISTED_STATE: PersistedState = {
@@ -100,6 +137,7 @@ export const INITIAL_PERSISTED_STATE: PersistedState = {
   previousCacheName: null,
   previousGeneration: null,
   pending: null,
+  drillLock: null,
 };
 
 export interface RollbackReview {
@@ -135,7 +173,7 @@ export type InstallerStatus =
       installId?: string;
       version: string | null;
       code: FailureCode;
-      scope?: 'install' | 'rollback';
+      scope?: 'install' | 'rollback' | 'drill';
     };
 
 export interface Snapshot {
@@ -143,5 +181,7 @@ export interface Snapshot {
   activeGeneration: string | null;
   previousVersion: string | null;
   previousGeneration: string | null;
+  /** 进行中的锁定演练绑定；无锁定演练时为 null。 */
+  drillLock: DrillLock | null;
   status: InstallerStatus;
 }

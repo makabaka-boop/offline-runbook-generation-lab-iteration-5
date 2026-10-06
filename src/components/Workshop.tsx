@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type {
   CatalogEntry,
+  DrillLock,
   FailureCode,
   InstallMode,
   InstallerStatus,
@@ -32,6 +33,11 @@ interface Props {
   previousVersion: string | null;
   previousTitle: string;
   rollbackStatus: Extract<InstallerStatus, { kind: 'rollback-reviewing' }> | null;
+  drillLock: DrillLock | null;
+  /** 始终按锁定代际缓存读取的手册包（锁定期间独立于普通步骤页的当前版）。 */
+  lockedBundle: ManualBundle | null;
+  lockLoadError: string;
+  onReleaseDrillLock: (sessionId: string) => void;
   onReviewRollback: () => void;
   onConfirmRollback: () => void;
   onCancelRollbackReview: () => void;
@@ -58,6 +64,10 @@ export function Workshop(props: Props) {
     previousVersion,
     previousTitle,
     rollbackStatus,
+    drillLock,
+    lockedBundle,
+    lockLoadError,
+    onReleaseDrillLock,
     onReviewRollback,
     onConfirmRollback,
     onCancelRollbackReview,
@@ -129,13 +139,43 @@ export function Workshop(props: Props) {
         </div>
       )}
 
+      {drillLock && (
+        <div className="banner lock" data-testid="drill-lock-banner">
+          本次演练已锁定版本 {drillLock.version}（代际 {drillLock.generation.slice(-6)}）：
+          演练的资源读取、动作次序与通过记录始终指向该锁定版；其他页面可继续安装并切换到新版，
+          但在本演练完成或取消前，再次安装或退回将被拒绝，锁定资源不会被删除。
+          {activeVersion !== drillLock.version && (
+            <div className="small" data-testid="drill-lock-diverged">
+              普通步骤页当前为版本 {activeVersion}；演练面板仍固定在锁定版 {drillLock.version}。
+            </div>
+          )}
+          <button
+            style={{ marginLeft: 12 }}
+            data-testid="drill-lock-release"
+            onClick={() => onReleaseDrillLock(drillLock.sessionId)}
+          >
+            {drillLock.passed ? '完成并释放锁定' : '取消演练并释放锁定'}
+          </button>
+        </div>
+      )}
+
+      {lockLoadError && (
+        <div className="banner error" data-testid="drill-lock-load-error">
+          锁定版手册读取失败：{lockLoadError}
+        </div>
+      )}
+
       {failed && (
         <div className="banner error" data-testid="failed-banner">
           {failureText[failed.code]}
           <div className="small">
             {failed.scope === 'rollback'
               ? '退回操作已拒绝；当前版和上一版缓存均保留，当前可用版本保持不变。'
-              : `未激活暂存缓存已清理，当前继续提供版本 ${activeVersion} 的完整手册。`}
+              : failed.scope === 'drill'
+                ? '未能开始锁定演练；任何手册缓存与代际指针均未改变。'
+                : failed.code === 'locked'
+                  ? '安装被拒绝：锁定演练正在使用该版本资源，第三份手册缓存不会被创建，锁定版继续可读。'
+                  : `未激活暂存缓存已清理，当前继续提供版本 ${activeVersion} 的完整手册。`}
           </div>
         </div>
       )}
@@ -199,6 +239,8 @@ export function Workshop(props: Props) {
             <DrillPanel
               version={bundle.manifest.version}
               entries={bundle.faults}
+              drillLock={drillLock}
+              lockedBundle={lockedBundle}
               onTerminated={handleDrillTerminated}
               onRecordsInvalidated={handleRecordsInvalidated}
             />
@@ -212,6 +254,7 @@ export function Workshop(props: Props) {
         previousTitle={previousTitle}
         status={rollbackStatus}
         installing={installing}
+        locked={drillLock !== null}
         swReady={swReady}
         onReview={onReviewRollback}
         onConfirm={onConfirmRollback}

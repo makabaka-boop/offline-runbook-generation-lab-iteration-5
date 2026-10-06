@@ -131,6 +131,7 @@ const makePorts = (bodies: Map<string, string>): FakePorts => {
               ? cloned.previousCacheName.split(':').pop() ?? null
               : null,
         pending: cloned.pending ?? null,
+        drillLock: cloned.drillLock ?? null,
       } as PersistedState;
     },
     async saveState(state) {
@@ -237,6 +238,10 @@ const makePorts = (bodies: Map<string, string>): FakePorts => {
 
     async deleteCache(name) {
       return this.caches.delete(name);
+    },
+
+    async cacheExists(name) {
+      return this.caches.has(name);
     },
 
     async listManualCaches() {
@@ -628,6 +633,7 @@ describe('InstallerCoordinator 状态协调', () => {
       activeCacheName: ports.store.activeCacheName,
       activeGeneration: ports.store.activeGeneration,
       pending: null,
+      drillLock: null,
     } as PersistedState;
     const reopened = new InstallerCoordinator(ports);
     await reopened.init();
@@ -742,6 +748,7 @@ describe('InstallerCoordinator 状态协调', () => {
       previousCacheName: v2Cache,
       previousGeneration: ports.store.activeGeneration!,
       pending: null,
+      drillLock: null,
     };
 
     expect(await c.confirmRollback()).toBe(false);
@@ -852,6 +859,242 @@ describe('InstallerCoordinator 状态协调', () => {
     expect(snapshots[0].active).toBeNull();
     const failedSnap = snapshots[snapshots.length - 1];
     expect(failedSnap).toEqual({ active: null, status: 'failed' });
+  });
+});
+
+describe('锁定演练版本', () => {
+  it('锁定后允许安装一版新手册：普通指针切新版，锁定缓存被保留为上一版且 drillLock 不变', async () => {
+    const v1 = makeEntry('1.0.0');
+    const v2 = makeEntry('2.0.0');
+    const ports = makePorts(new Map([...v1.bodies, ...v2.bodies]));
+    const c = new InstallerCoordinator(ports);
+    await c.init();
+    await c.install(v1.entry);
+    const v1Cache = activeCacheNameOf(ports);
+
+    const lock = await c.acquireDrillLock();
+    expect(lock).toMatchObject({ version: '1.0.0', cacheName: v1Cache });
+    expect(ports.store.drillLock?.cacheName).toBe(v1Cache);
+
+    await c.install(v2.entry);
+
+    expect(c.getSnapshot().status).toMatchObject({ kind: 'activated' });
+    expect(ports.store).toMatchObject({
+      activeVersion: '2.0.0',
+      previousVersion: '1.0.0',
+      previousCacheName: v1Cache,
+    });
+    // 锁定绑定仍指向 v1 缓存，且该缓存仍存在、可读。
+    expect(ports.store.drillLock).toMatchObject({ version: '1.0.0', cacheName: v1Cache });
+    expect(ports.caches.has(v1Cache)).toBe(true);
+    const names = await ports.listManualCaches();
+    expect(names).toHaveLength(2);
+    expect(c.getSnapshot().drillLock?.version).toBe('1.0.0');
+  });
+
+  it('锁定后同版本重装被拒绝（需要第三份缓存），不改动任何指针或缓存', async () => {
+    const v1 = makeEntry('1.0.0');
+    const ports = makePorts(v1.bodies);
+    const c = new InstallerCoordinator(ports);
+    await c.init();
+    await c.install(v1.entry);
+    const v1Cache = activeCacheNameOf(ports);
+    const lock = (await c.acquireDrillLock())!;
+    ports.fetchUrls.length = 0;
+
+    await c.install(v1.entry);
+
+    expect(c.getSnapshot().status).toMatchObject({ kind: 'failed', code: 'locked' });
+    expect(ports.store.activeVersion).toBe('1.0.0');
+    expect(ports.store.activeCacheName).toBe(v1Cache);
+    expect(ports.store.pending).toBeNull();
+    expect(ports.store.drillLock?.sessionId).toBe(lock.sessionId);
+    expect(ports.fetchUrls).toEqual([]);
+    expect(await ports.listManualCaches()).toEqual([v1Cache]);
+  });
+
+  it('锁定后安装一次新版，再装任何版本都被拒绝，绝不删除锁定资源', async () => {
+    const v1 = makeEntry('1.0.0');
+    const v2 = makeEntry('2.0.0');
+    const ports = makePorts(new Map([...v1.bodies, ...v2.bodies]));
+    const c = new InstallerCoordinator(ports);
+    await c.init();
+    await c.install(v1.entry);
+    const v1Cache = activeCacheNameOf(ports);
+    await c.acquireDrillLock();
+
+    await c.install(v2.entry);
+    const v2Cache = activeCacheNameOf(ports);
+    expect(v2Cache).not.toBe(v1Cache);
+
+    // 再次安装（第三版/同版重装都需第三份缓存）：拒绝。
+    await c.install(v1.entry);
+    expect(c.getSnapshot().status).toMatchObject({ kind: 'failed', code: 'locked' });
+    expect(ports.store).toMatchObject({ activeVersion: '2.0.0', previousVersion: '1.0.0' });
+    expect(ports.caches.has(v1Cache)).toBe(true);
+    expect(ports.caches.has(v2Cache)).toBe(true);
+    expect(ports.store.pending).toBeNull();
+
+    await c.install(v2.entry);
+    expect(c.getSnapshot().status).toMatchObject({ kind: 'failed', code: 'locked' });
+    expect(ports.caches.has(v1Cache)).toBe(true);
+    expect(ports.caches.has(v2Cache)).toBe(true);
+  });
+
+  it('锁定期间退回被复核与确认两道关口拒绝，两个缓存都不删除', async () => {
+    const v1 = makeEntry('1.0.0');
+    const v2 = makeEntry('2.0.0');
+    const ports = makePorts(new Map([...v1.bodies, ...v2.bodies]));
+    const c = new InstallerCoordinator(ports);
+    await c.init();
+    await c.install(v1.entry);
+    const v1Cache = ports.store.activeCacheName!;
+    await c.acquireDrillLock();
+    await c.install(v2.entry);
+    const v2Cache = ports.store.activeCacheName!;
+
+    expect(await c.reviewRollback(v1.entry)).toBeNull();
+    expect(c.getSnapshot().status).toMatchObject({
+      kind: 'failed',
+      code: 'locked',
+      scope: 'rollback',
+    });
+    expect(ports.store.activeVersion).toBe('2.0.0');
+    expect(ports.caches.has(v1Cache)).toBe(true);
+    expect(ports.caches.has(v2Cache)).toBe(true);
+
+    // 即使绕过本地复核直接确认（另一标签路径），CAS 也必须拒绝。
+    expect(await c.confirmRollback()).toBe(false);
+    expect(c.getSnapshot().status).toMatchObject({ code: 'locked', scope: 'rollback' });
+    expect(ports.store.activeVersion).toBe('2.0.0');
+  });
+
+  it('释放锁定后可再次安装；新安装回收原有上一版，恢复最多两缓存语义', async () => {
+    const v1 = makeEntry('1.0.0');
+    const v2 = makeEntry('2.0.0');
+    const ports = makePorts(new Map([...v1.bodies, ...v2.bodies]));
+    const c = new InstallerCoordinator(ports);
+    await c.init();
+    await c.install(v1.entry);
+    const v1Cache = ports.store.activeCacheName!;
+    const lock = (await c.acquireDrillLock())!;
+    await c.install(v2.entry);
+    const v2Cache = ports.store.activeCacheName!;
+
+    expect(await c.releaseDrillLock(lock.sessionId)).toBe(true);
+    expect(ports.store.drillLock).toBeNull();
+
+    // 释放后安装不再被拒绝：v1 重新激活并产生新代际缓存，恢复最多两缓存语义。
+    await c.install(v1.entry);
+    expect(c.getSnapshot().status).toMatchObject({ kind: 'activated' });
+    expect(ports.store.activeVersion).toBe('1.0.0');
+    expect(ports.store.previousVersion).toBe('2.0.0');
+    const names = await ports.listManualCaches();
+    expect(names).toHaveLength(2);
+    expect(names).toContain(v2Cache);
+    // v1 以新代际缓存激活；旧 v1 缓存不再是当前/上一版而被回收。
+    expect(names).not.toContain(v1Cache);
+  });
+
+  it('刷新恢复：drillLock 持久化且其缓存被保留；pending 半包照常清理', async () => {
+    const v1 = makeEntry('1.0.0');
+    const v2 = makeEntry('2.0.0');
+    const ports = makePorts(new Map([...v1.bodies, ...v2.bodies]));
+    const first = new InstallerCoordinator(ports);
+    await first.init();
+    await first.install(v1.entry);
+    const v1Cache = ports.store.activeCacheName!;
+    const lock = (await first.acquireDrillLock())!;
+    await first.install(v2.entry);
+    expect(ports.store).toMatchObject({ activeVersion: '2.0.0', previousVersion: '1.0.0' });
+
+    // 模拟安装 v2 之后又开始一次 v2 重装并中途被杀（pending 残留 + 半包缓存）。
+    const leftover = stageCacheNameFor('2.0.0', 'leftover');
+    ports.store = {
+      ...ports.store,
+      pending: {
+        version: '2.0.0',
+        cacheName: leftover,
+        installId: 'leftover',
+        mode: 'full',
+        startedAt: 900,
+      },
+    };
+    ports.caches.set(leftover, new Map([[v2.entry.resources[0].url, new Response('half')]]));
+
+    const reopened = new InstallerCoordinator(ports);
+    await reopened.init();
+
+    expect(reopened.getSnapshot().activeVersion).toBe('2.0.0');
+    expect(ports.store.pending).toBeNull();
+    expect(ports.caches.has(leftover)).toBe(false);
+    // 锁定绑定与锁定缓存仍在。
+    expect(ports.store.drillLock?.sessionId).toBe(lock.sessionId);
+    expect(ports.store.drillLock?.cacheName).toBe(v1Cache);
+    expect(ports.caches.has(v1Cache)).toBe(true);
+    expect((await ports.listManualCaches()).sort()).toEqual([v1Cache, ports.store.activeCacheName!].sort());
+  });
+
+  it('刷新时若锁定缓存已被手动删除，绑定被释放而不是指向缺失资源', async () => {
+    const v1 = makeEntry('1.0.0');
+    const ports = makePorts(v1.bodies);
+    const first = new InstallerCoordinator(ports);
+    await first.init();
+    await first.install(v1.entry);
+    const lock = (await first.acquireDrillLock())!;
+    ports.caches.delete(lock.cacheName);
+
+    const reopened = new InstallerCoordinator(ports);
+    await reopened.init();
+    expect(ports.store.drillLock).toBeNull();
+    expect(reopened.getSnapshot().drillLock).toBeNull();
+  });
+
+  it('锁定进度可持久化并恢复，且通过记录随会话保留', async () => {
+    const v1 = makeEntry('1.0.0');
+    const ports = makePorts(v1.bodies);
+    const c = new InstallerCoordinator(ports);
+    await c.init();
+    await c.install(v1.entry);
+    const lock = (await c.acquireDrillLock())!;
+    expect(await c.pinDrillFault(lock.sessionId, 'f-1')).toBe(true);
+    expect(
+      await c.persistDrillProgress(lock.sessionId, {
+        checkedUpTo: 2,
+        passed: false,
+        records: [],
+      }),
+    ).toBe(true);
+    expect(ports.store.drillLock).toMatchObject({ faultId: 'f-1', checkedUpTo: 2 });
+
+    // 过期会话标识不得覆盖当前锁定。
+    expect(
+      await c.persistDrillProgress('other-session', { checkedUpTo: 9, passed: true, records: [] }),
+    ).toBe(false);
+    expect(ports.store.drillLock?.checkedUpTo).toBe(2);
+
+    const reopened = new InstallerCoordinator(ports);
+    await reopened.init();
+    expect(reopened.getSnapshot().drillLock).toMatchObject({
+      sessionId: lock.sessionId,
+      faultId: 'f-1',
+      checkedUpTo: 2,
+    });
+  });
+
+  it('无激活版本或已有锁定时不能再次获取锁定', async () => {
+    const v1 = makeEntry('1.0.0');
+    const ports = makePorts(v1.bodies);
+    const c = new InstallerCoordinator(ports);
+    await c.init();
+    expect(await c.acquireDrillLock()).toBeNull();
+    expect(c.getSnapshot().status).toMatchObject({ code: 'missing', scope: 'drill' });
+
+    await c.install(v1.entry);
+    const first = await c.acquireDrillLock();
+    expect(first).not.toBeNull();
+    expect(await c.acquireDrillLock()).toBeNull();
+    expect(c.getSnapshot().status).toMatchObject({ code: 'locked', scope: 'drill' });
   });
 });
 

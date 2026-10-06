@@ -2,7 +2,7 @@
  * 手册正文与任何资源都不写入 IndexedDB——离线读取由 Service Worker + Cache Storage 负责。
  * 该模块同时被页面与 Service Worker 使用。
  */
-import type { PersistedState } from './types';
+import type { DrillLock, PersistedState } from './types';
 import { INITIAL_PERSISTED_STATE } from './types';
 
 const DB_NAME = 'manual-kiosk-db';
@@ -15,6 +15,52 @@ type IDBFactoryLike = IDBFactory;
 const generationFromCacheName = (cacheName: string): string => {
   const parts = cacheName.split(':');
   return parts.length >= 4 ? parts[parts.length - 1] : '';
+};
+
+/** 规范化锁定演练记录；字段缺失或代际/缓存名不自洽时视为无锁定（绝不绑定到错误缓存）。 */
+const normalizeDrillLock = (raw: unknown): DrillLock | null => {
+  if (!raw || typeof raw !== 'object') return null;
+  const l = raw as Partial<DrillLock>;
+  if (
+    typeof l.sessionId !== 'string' ||
+    typeof l.version !== 'string' ||
+    typeof l.cacheName !== 'string' ||
+    typeof l.generation !== 'string' ||
+    typeof l.faultId !== 'string'
+  ) {
+    return null;
+  }
+  if (generationFromCacheName(l.cacheName) !== l.generation) return null;
+  const checkedUpTo = Number(l.checkedUpTo);
+  const records = Array.isArray(l.records)
+    ? l.records
+        .filter(
+          (r): r is NonNullable<DrillLock['records']>[number] =>
+            !!r &&
+            typeof r === 'object' &&
+            typeof (r as { version?: unknown }).version === 'string' &&
+            typeof (r as { entryId?: unknown }).entryId === 'string' &&
+            typeof (r as { code?: unknown }).code === 'string',
+        )
+        .map((r) => ({
+          version: r.version,
+          entryId: r.entryId,
+          totalActions: Number(r.totalActions) || 0,
+          passedAt: Number(r.passedAt) || 0,
+          code: r.code,
+        }))
+    : [];
+  return {
+    sessionId: l.sessionId,
+    version: l.version,
+    cacheName: l.cacheName,
+    generation: l.generation,
+    faultId: l.faultId,
+    checkedUpTo: Number.isFinite(checkedUpTo) && checkedUpTo >= 0 ? Math.trunc(checkedUpTo) : 0,
+    passed: Boolean(l.passed),
+    records,
+    startedAt: Number(l.startedAt) || 0,
+  };
 };
 
 export function openStateDb(idbFactory: IDBFactoryLike = indexedDB): Promise<IDBDatabase> {
@@ -85,6 +131,7 @@ export async function readState(db?: IDBDatabase): Promise<PersistedState> {
               startedAt: Number(s.pending.startedAt) || 0,
             }
           : null,
+      drillLock: normalizeDrillLock(s.drillLock),
     };
   } finally {
     if (owned) handle.close();
@@ -127,6 +174,12 @@ export async function commitStateIfPending(
           // 请求成功但代次不属于本次尝试：不能写入，也不能中止其他代次。
           return;
         }
+        // 安装期间其他标签页若开始/释放了锁定演练，本次提交不得用旧锁定覆盖其决定。
+        const currentLock = normalizeDrillLock(current?.drillLock);
+        const nextLock = normalizeDrillLock(state.drillLock);
+        if ((currentLock?.sessionId ?? null) !== (nextLock?.sessionId ?? null)) {
+          return;
+        }
         store.put(state, KEY);
         committed = true;
       };
@@ -167,6 +220,8 @@ export async function commitRollbackIfActive(
             : {};
         if (
           current.pending ||
+          // 锁定演练期间退回一律拒绝：退回会使锁定缓存变成“上一版”，随时可能被下一次安装回收。
+          normalizeDrillLock(current.drillLock) ||
           current.activeVersion !== expected.activeVersion ||
           current.activeGeneration !== expected.activeGeneration ||
           current.activeCacheName !== expected.activeCacheName ||

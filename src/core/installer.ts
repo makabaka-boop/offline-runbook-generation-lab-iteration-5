@@ -10,9 +10,12 @@
  * 4. IndexedDB 的代际切换先于缓存回收（崩溃也只会留下孤儿缓存，下次启动回收）。
  * 5. 摘要复用只从当前激活代际复制字节到新暂存区；新代际激活后拥有独立缓存，成功后最多保留当前与紧邻上一版。
  * 6. 退回只在复核上一版全部资源与整单摘要后执行一次 CAS 指针交换；失败时不清理任一已激活缓存。
+ * 7. 锁定演练把会话固定到锁定代际缓存：允许随后安装一版新手册（普通页切新版、锁定演练继续读锁定缓存）；
+ *    在锁定释放前，任何需要第三份手册缓存的再次安装/退回一律拒绝（'locked'），绝不删除正在使用的资源。
  */
 import type {
   CatalogEntry,
+  DrillLock,
   FailureCode,
   InstallMode,
   PersistedState,
@@ -23,6 +26,7 @@ import type {
 import { INITIAL_PERSISTED_STATE } from './types';
 import { encodeCanonicalResourceList } from './resource-digest';
 import {
+  cacheNameMatchesGeneration,
   installGenerationFromCacheName,
   stageCacheNameFor,
   type InstallGeneration,
@@ -76,6 +80,12 @@ export class StaleRollbackError extends Error {
     this.name = 'StaleRollbackError';
   }
 }
+export class LockedDrillError extends Error {
+  constructor(message = '锁定演练仍在进行，操作需要第三份手册缓存') {
+    super(message);
+    this.name = 'LockedDrillError';
+  }
+}
 
 export interface StagedResource {
   bytes: Uint8Array;
@@ -114,6 +124,8 @@ export interface InstallerPorts {
   openCache(name: string): Promise<ManualCacheLike>;
   readCacheEntry(cacheName: string, ref: ResourceRef): Promise<StagedResource | null>;
   deleteCache(name: string): Promise<boolean>;
+  /** 指定缓存是否仍存在（用于刷新后确认锁定演练绑定的缓存未被手动清除）。 */
+  cacheExists(name: string): Promise<boolean>;
   /** 列出当前所有代际缓存键名（前缀 manual:）。 */
   listManualCaches(): Promise<string[]>;
   now(): number;
@@ -135,6 +147,7 @@ const toFailureCode = (err: unknown): FailureCode => {
   if (err instanceof RollbackBusyError) return 'busy';
   if (err instanceof RollbackMissingError) return 'missing';
   if (err instanceof StaleRollbackError) return 'stale';
+  if (err instanceof LockedDrillError) return 'locked';
   if (err instanceof QuotaError) return 'quota';
   if (err instanceof HttpError) return 'network';
   if (err instanceof Error) {
@@ -145,6 +158,7 @@ const toFailureCode = (err: unknown): FailureCode => {
     if (name === 'RollbackBusyError') return 'busy';
     if (name === 'RollbackMissingError') return 'missing';
     if (name === 'StaleRollbackError') return 'stale';
+    if (name === 'LockedDrillError') return 'locked';
     if (
       name === 'QuotaExceededError' ||
       /quota|exceeded/i.test(err.message)
@@ -178,6 +192,7 @@ export class InstallerCoordinator {
     activeGeneration: null,
     previousVersion: null,
     previousGeneration: null,
+    drillLock: null,
     status: { kind: 'idle' },
   };
   private current: InstallAttempt | null = null;
@@ -207,6 +222,7 @@ export class InstallerCoordinator {
       activeGeneration: this.state.activeGeneration,
       previousVersion: this.state.previousVersion,
       previousGeneration: this.state.previousGeneration,
+      drillLock: this.state.drillLock,
       status,
     };
   }
@@ -244,6 +260,15 @@ export class InstallerCoordinator {
       state.pending = null;
       await this.ports.saveState(state);
     }
+    // 刷新恢复：锁定缓存若已不在 Cache Storage（如用户在 DevTools 手动删除），
+    // 锁定无法继续，显式释放绑定而不是让会话指向不存在的资源。
+    if (state.drillLock) {
+      const present = await this.ports.cacheExists(state.drillLock.cacheName);
+      if (!present) {
+        state.drillLock = null;
+        await this.ports.saveState(state);
+      }
+    }
     this.state = state;
     this.clearRollbackReview();
     await this.reconcileCaches();
@@ -253,9 +278,11 @@ export class InstallerCoordinator {
 
   private async reconcileCaches() {
     const keep = new Set(
-      [this.state.activeCacheName, this.state.previousCacheName].filter(
-        (name): name is string => Boolean(name),
-      ),
+      [
+        this.state.activeCacheName,
+        this.state.previousCacheName,
+        this.state.drillLock?.cacheName,
+      ].filter((name): name is string => Boolean(name)),
     );
     let names: string[] = [];
     try {
@@ -298,6 +325,28 @@ export class InstallerCoordinator {
     if (this.current) {
       // 同一时间只允许一个安装；重复点击直接忽略。
       return;
+    }
+
+    // 锁定演练保护：锁定后只允许“恰好一次”跨版本安装——
+    // 即当前版正是锁定版、且尚无“上一版”缓存时安装另一版本（旧激活缓存变为上一版，恰为锁定缓存）。
+    // 其余任何安装（含同版重装，以及已有新版后再次安装/升第三版）都需要第三份手册缓存，
+    // 必须明确拒绝，绝不删除演练正在使用的资源。
+    const fresh = await this.ports.loadState().catch(() => this.state);
+    this.state = fresh;
+    const lock = fresh.drillLock;
+    if (lock) {
+      const allowedSingleUpgrade =
+        fresh.previousVersion === null &&
+        fresh.previousCacheName === null &&
+        fresh.activeVersion === lock.version &&
+        fresh.activeCacheName === lock.cacheName &&
+        fresh.activeGeneration === lock.generation &&
+        fresh.activeVersion !== null &&
+        entry.version !== fresh.activeVersion;
+      if (!allowedSingleUpgrade) {
+        this.setStatus({ kind: 'failed', version: entry.version, code: 'locked' });
+        return;
+      }
     }
 
     const mode: InstallMode = options.mode === 'reuse' ? 'reuse' : 'full';
@@ -394,6 +443,8 @@ export class InstallerCoordinator {
         previousCacheName: previous?.cacheName ?? null,
         previousGeneration: previous?.generation ?? null,
         pending: null,
+        // 锁定演练绑定随安装保留：SW/步骤页改读新激活缓存，锁定演练继续指向锁定缓存。
+        drillLock: this.state.drillLock,
       };
       const committed = await this.ports.commitStateIfPending(nextState, installId);
       if (!committed) throw new StaleGenerationError();
@@ -420,6 +471,10 @@ export class InstallerCoordinator {
     try {
       const state = await this.ports.loadState();
       this.state = state;
+      // 锁定优先判定：即使没有上一版，也必须明确告知“因锁定被拒绝”，而非“缺少上一版”。
+      if (state.drillLock) {
+        throw new LockedDrillError('锁定演练仍在进行，不能退回版本');
+      }
       if (this.current || state.pending) throw new RollbackBusyError();
       if (
         !state.activeVersion ||
@@ -492,11 +547,14 @@ export class InstallerCoordinator {
     const review = this.rollbackReview;
     try {
       if (this.current) throw new RollbackBusyError();
-      if (!review) throw new RollbackMissingError();
+      if (!review) throw new LockedDrillError('锁定演练仍在进行，不能退回版本');
 
       const state = await this.ports.loadState();
       this.state = state;
       if (state.pending) throw new RollbackBusyError();
+      if (state.drillLock) {
+        throw new LockedDrillError('锁定演练仍在进行，不能退回版本');
+      }
       if (
         state.activeVersion !== review.fromVersion ||
         state.activeGeneration !== review.fromGeneration ||
@@ -537,6 +595,7 @@ export class InstallerCoordinator {
         previousCacheName: currentCacheName,
         previousGeneration: currentGeneration,
         pending: null,
+        drillLock: state.drillLock,
       };
       const committed = await this.ports.commitRollbackIfActive(nextState, {
         activeVersion: review.fromVersion,
@@ -608,6 +667,121 @@ export class InstallerCoordinator {
       this.setStatus({ kind: 'rollback-reviewing', review: this.reviewSnapshot() });
     } else {
       this.setStatus({ kind: 'idle' });
+    }
+  }
+
+  /**
+   * 开始一次“锁定版本”的演练：把当前激活代际固定为锁定缓存。
+   * 失败返回 null 并以 scope:'drill' 上报告错（安装中/无激活版/已有锁定），不改动任何指针与缓存。
+   */
+  async acquireDrillLock(): Promise<DrillLock | null> {
+    await this.init();
+    try {
+      if (this.current) throw new RollbackBusyError();
+      const state = await this.ports.loadState();
+      this.state = state;
+      if (state.drillLock) {
+        throw new LockedDrillError('已有进行中的锁定演练，请先完成或取消');
+      }
+      if (
+        !state.activeVersion ||
+        !state.activeCacheName ||
+        !state.activeGeneration ||
+        !cacheNameMatchesGeneration(state.activeCacheName, state.activeGeneration)
+      ) {
+        throw new RollbackMissingError();
+      }
+      const lock: DrillLock = {
+        sessionId: `drill-${this.ports.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        version: state.activeVersion,
+        cacheName: state.activeCacheName,
+        generation: state.activeGeneration,
+        faultId: '',
+        checkedUpTo: 0,
+        passed: false,
+        records: [],
+        startedAt: this.ports.now(),
+      };
+      const next: PersistedState = { ...state, drillLock: lock };
+      await this.ports.saveState(next);
+      this.state = next;
+      this.notifyDrillLockChanged();
+      this.setStatus({ kind: 'idle' });
+      return lock;
+    } catch (err) {
+      const code: FailureCode = toFailureCode(err);
+      this.setStatus({ kind: 'failed', version: null, code, scope: 'drill' });
+      return null;
+    }
+  }
+
+  /** 把锁定会话固定到具体故障条目；必须是当前锁定会话，且条目此前未固定。 */
+  async pinDrillFault(sessionId: string, faultId: string): Promise<boolean> {
+    await this.init();
+    const state = await this.ports.loadState().catch(() => this.state);
+    const lock = state.drillLock;
+    if (!lock || lock.sessionId !== sessionId || !faultId) return false;
+    if (lock.faultId && lock.faultId !== faultId) return false;
+    if (lock.faultId === faultId) return true;
+    const nextLock: DrillLock = { ...lock, faultId, checkedUpTo: 0, passed: false };
+    const next: PersistedState = { ...state, drillLock: nextLock };
+    await this.ports.saveState(next);
+    this.state = next;
+    this.notifyDrillLockChanged();
+    this.setStatus({ kind: 'idle' });
+    return true;
+  }
+
+  /**
+   * 持久化锁定演练的动作进度与通过记录（每步勾选后写入，刷新可恢复）。
+   * 会话标识不匹配或已释放时拒绝，调用方应停止使用过期会话。
+   */
+  async persistDrillProgress(
+    sessionId: string,
+    progress: Pick<DrillLock, 'checkedUpTo' | 'passed' | 'records'>,
+  ): Promise<boolean> {
+    const state = await this.ports.loadState().catch(() => null);
+    const lock = state?.drillLock;
+    if (!state || !lock || lock.sessionId !== sessionId) return false;
+    const nextLock: DrillLock = {
+      ...lock,
+      checkedUpTo: progress.checkedUpTo,
+      passed: progress.passed,
+      records: progress.records,
+    };
+    const next: PersistedState = { ...state, drillLock: nextLock };
+    await this.ports.saveState(next);
+    this.state = next;
+    // 发出新快照驱动 UI 刷新（勾选进度来自持久化的锁定状态，而不是组件本地状态）。
+    this.emit();
+    return true;
+  }
+
+  /** 完成或取消演练：释放锁定并恢复正常安装/回收语义。 */
+  async releaseDrillLock(sessionId: string): Promise<boolean> {
+    await this.init();
+    const state = await this.ports.loadState().catch(() => null);
+    if (!state?.drillLock || state.drillLock.sessionId !== sessionId) return false;
+    const next: PersistedState = { ...state, drillLock: null };
+    await this.ports.saveState(next);
+    this.state = next;
+    this.notifyDrillLockChanged();
+    this.setStatus({ kind: 'idle' });
+    return true;
+  }
+
+  private notifyDrillLockChanged() {
+    if (typeof BroadcastChannel !== 'function') return;
+    try {
+      if (!this.generationChannel) {
+        this.generationChannel = new BroadcastChannel('manual-generation');
+      }
+      this.generationChannel.postMessage({
+        type: 'drill-lock-changed',
+        sessionId: this.state.drillLock?.sessionId ?? null,
+      });
+    } catch {
+      // 跨标签同步是便利能力；IndexedDB 中的绑定本身已持久化。
     }
   }
 

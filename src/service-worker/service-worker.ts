@@ -10,7 +10,10 @@
  * 构建期由 plugins/sw-build.ts 通过 esbuild define 注入 SW_VERSION / SW_PRECACHE。
  */
 import { readState } from '../core/idb';
-import { cacheNameMatchesGeneration } from '../core/generation';
+import {
+  cacheNameMatchesGeneration,
+  installGenerationFromCacheName,
+} from '../core/generation';
 
 declare const SW_VERSION: string;
 declare const SW_PRECACHE: { url: string; revision: string }[];
@@ -66,11 +69,34 @@ sw.addEventListener('activate', (event) => {
 const isManualResource = (url: URL): boolean =>
   url.origin === sw.location.origin && url.pathname.startsWith('/manuals/');
 
-/** 手册资源：仅从 IDB 指向且通过同一安装代次校验的激活缓存出；暂存/半包缓存永不可见。 */
-const serveActiveManual = async (request: Request): Promise<Response | undefined> => {
+/**
+ * 手册资源：锁定演练的读取永远从锁定代际缓存出（普通页已切新版也不受影响）；
+ * 其余读取只从 IDB 当前激活代际缓存出；暂存/半包缓存永不可见。
+ */
+const serveManual = async (request: Request): Promise<Response | undefined> => {
   const state = await readState();
   if (!state.activeCacheName || !state.activeGeneration) return undefined;
   if (!cacheNameMatchesGeneration(state.activeCacheName, state.activeGeneration)) return undefined;
+
+  // 锁定演练读取：页面在请求头中带上锁定缓存名，SW 必须校验该缓存名携带的安装代次
+  // 与 IDB 中持久化的锁定绑定一致，才允许从锁定缓存提供，防止任意头值读取其他缓存。
+  const lockedCacheName = request.headers.get('x-manual-drill-cache');
+  if (lockedCacheName) {
+    const lock = state.drillLock;
+    if (
+      lock &&
+      lockedCacheName === lock.cacheName &&
+      cacheNameMatchesGeneration(lock.cacheName, lock.generation) &&
+      installGenerationFromCacheName(lock.cacheName)?.version === lock.version
+    ) {
+      const lockedCache = await caches.open(lock.cacheName);
+      const lockedHit = await lockedCache.match(request, { ignoreSearch: true });
+      // 锁定读取未命中必须直接失败：绝不能回退到当前激活缓存或网络而混入别的版本。
+      return lockedHit ?? Response.error();
+    }
+    return undefined;
+  }
+
   const cache = await caches.open(state.activeCacheName);
   const hit = await cache.match(request, { ignoreSearch: true });
   return hit ?? undefined;
@@ -95,12 +121,15 @@ sw.addEventListener('fetch', (event) => {
   //    安装请求（带 x-manual-install 标记）强制走网络重新下载，绝不从当前激活缓存读，
   //    从而“重装/升级”确实重新下载校验；离线时安装请求应失败（而非读旧内容）。
   const isInstallRequest = request.headers.get('x-manual-install') === '1';
+  const isLockedDrillRead = request.headers.get('x-manual-drill-cache') !== null;
   if (isManualResource(url)) {
     event.respondWith(
       (async () => {
         if (!isInstallRequest) {
-          const active = await serveActiveManual(request);
-          if (active) return active;
+          const manual = await serveManual(request);
+          if (manual) return manual;
+          // 锁定演练读取只能来自锁定缓存：未命中不得回退网络/激活缓存，避免混入新版本。
+          if (isLockedDrillRead) return Response.error();
         }
         // 网络结果绝不写入缓存，避免半包经 SW 泄露给后续读取。
         return fetch(request, { cache: 'no-store' });

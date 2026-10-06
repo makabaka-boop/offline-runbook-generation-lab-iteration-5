@@ -172,6 +172,23 @@ button.danger {
   color: #f5cb8a;
   background: rgba(240, 160, 32, 0.08);
 }
+.banner.lock {
+  border-color: #b48cf2;
+  color: #d3b8ff;
+  background: rgba(140, 102, 240, 0.1);
+}
+.lock-toggle {
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border: 1px dashed #b48cf2;
+  border-radius: 10px;
+}
+.lock-toggle label {
+  font-weight: 600;
+  white-space: nowrap;
+}
 
 ol.steps {
   list-style: none;

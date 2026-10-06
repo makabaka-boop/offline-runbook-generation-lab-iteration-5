@@ -18,7 +18,7 @@ export interface InstallFailure {
   installId?: string;
   version: string | null;
   code: FailureCode;
-  scope?: 'install' | 'rollback';
+  scope?: 'install' | 'rollback' | 'drill';
 }
 
 export interface ActivatedInfo {
@@ -140,6 +140,7 @@ const failureTextOf = (code: FailureCode): string => {
     busy: '安装仍在进行，不能退回版本；当前可用版本保持不变',
     missing: '上一版完整缓存缺失，不能退回；当前可用版本保持不变',
     stale: '退回确认已过期：另一标签页已完成切换，未覆盖新代际',
+    locked: '锁定演练仍在进行：该操作需要第三份手册缓存，已拒绝（不会删除演练正在使用的版本）',
     unknown: '发生未知错误',
   };
   return map[code];
@@ -151,6 +152,7 @@ interface RollbackControlsProps {
   previousTitle: string;
   status: Extract<InstallerStatus, { kind: 'rollback-reviewing' }> | null;
   installing: InstallProgress | null;
+  locked: boolean;
   swReady: boolean;
   onReview: () => void;
   onConfirm: () => void;
@@ -163,6 +165,7 @@ export function RollbackControls({
   previousTitle,
   status,
   installing,
+  locked,
   swReady,
   onReview,
   onConfirm,
@@ -194,12 +197,24 @@ export function RollbackControls({
           <button
             className="primary"
             data-testid="rollback-review"
-            disabled={!swReady || installing !== null}
-            title={installing ? '安装仍在进行时不能退回' : '复核上一版缓存与整单摘要'}
+            disabled={!swReady || installing !== null || locked}
+            title={
+              locked
+                ? '锁定演练仍在进行，退回需要第三份手册缓存，已拒绝'
+                : installing
+                  ? '安装仍在进行时不能退回'
+                  : '复核上一版缓存与整单摘要'
+            }
             onClick={onReview}
           >
             复核上一版
           </button>
+        </div>
+      )}
+
+      {locked && previousVersion && !reviewingThis && (
+        <div className="small" data-testid="rollback-locked-note" style={{ marginTop: 6 }}>
+          锁定演练进行中：退回会把锁定版降为上一版并需要第三份缓存，已锁定期间禁用。
         </div>
       )}
 

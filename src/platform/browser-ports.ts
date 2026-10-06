@@ -110,6 +110,11 @@ export function createBrowserPorts(): InstallerPorts {
 
     deleteCache: (name: string) => caches.delete(name),
 
+    async cacheExists(name: string) {
+      const keys = await caches.keys();
+      return keys.includes(name);
+    },
+
     async listManualCaches() {
       const keys = await caches.keys();
       return keys.filter((k) => k.startsWith('manual:'));

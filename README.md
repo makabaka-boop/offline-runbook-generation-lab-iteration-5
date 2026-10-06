@@ -23,8 +23,15 @@
 - **中断新版安装后离线刷新，仍打开旧版**；只有**完整重装并激活**后，页面才只显示新版步骤。
 - **离线演练**：搜索**当前版**故障条目 → **依序勾选**动作 → 得到**与版本绑定的通过结论**；
   切换或退回版本会终止未完成演练，并使旧版本的通过结论失效。
+- **可选“锁定本次演练版本”**：开始演练时可把当前代际（版本 + 安装代次 + 故障条目）固定到演练会话。
+  锁定后**允许随后成功安装一版新手册**——普通步骤页切到新版，而该演练的资源读取、动作次序与
+  通过记录始终指向锁定版缓存（Service Worker 按锁定代际提供，离线可读）。安装器、IndexedDB 指针与
+  缓存回收共同保证锁定缓存不被删除：**在锁定演练结束前，若再次安装或退回需要第三份手册缓存，
+  一律明确拒绝（`locked`），绝不删除正在使用的资源**。刷新后恢复会话与版本绑定（含勾选进度与通过记录），
+  **完成或取消才释放锁定**；下载、校验或持久化失败均不产生混合版本。未选择锁定时，沿用现有
+  “切版即终止演练”的语义。
 - 离线读取由 **Service Worker + Cache Storage** 负责；
-  **IndexedDB 只保存当前/上一版代际指针与安装状态**一条记录，不存手册正文。
+  **IndexedDB 只保存当前/上一版代际指针、安装状态与锁定演练绑定一条记录**，不存手册正文。
 - 浏览器缺少 Service Worker / Cache Storage / IndexedDB / Web Crypto 等能力时，页面显示
   **`UNSUPPORTED`**，不降级、不提供占位实现。
 
@@ -38,13 +45,13 @@ src/core/                    纯逻辑（无 DOM 依赖）
   generation.ts              安装代次与缓存键名规则（页面、SW 共享）
   resource-digest.ts         整份资源清单的规范化摘要
   drill.ts                   演练：搜索、依序勾选、版本绑定结论、切版终止
-  idb.ts                     IndexedDB 仅存“当前代际 + 安装状态”
-src/service-worker/          SW：手册只从当前激活代际缓存读取，应用壳预缓存
+  idb.ts                     IndexedDB 仅存“当前代际 + 安装状态 + 锁定演练绑定”
+src/service-worker/          SW：手册从当前激活代际缓存读取；锁定演练请求按 x-manual-drill-cache 固定读锁定代际
 src/platform/                浏览器端口（Cache/fetch/WebCrypto）、能力检测、SW 注册
-src/components/              React UI（安装管理、步骤、离线演练）
+src/components/              React UI（安装管理、步骤、离线演练、锁定版本开关）
 src/test/fault-injection.ts  仅用于端到端的 SW 故障注入（无规则时完全透传，不影响生产）
 plugins/sw-build.ts          构建期用 esbuild 编译 SW 并注入应用壳预缓存清单
-e2e/                         Playwright：中断安装、离线重载、演练、首次失败、UNSUPPORTED
+e2e/                         Playwright：中断安装、离线重载、演练、首次失败、锁定演练、UNSUPPORTED
 ```
 
 ## 本地开发
@@ -60,8 +67,8 @@ npm run dev        # http://localhost:5173（开发模式 SW 网络优先，支�
 npm run build      # 生成目录 + tsc 类型检查 + Vite 生产构建（含 SW 与预缓存清单）
 npm run preview    # 本地静态预览（默认 http://localhost:4173）
 
-npm run test       # Vitest：完整/摘要复用、取消/断网/校验/配额/中断重开/迟到代次/升级回收/退回边界
-npm run e2e        # Playwright：复用安装、中断安装与离线重载、离线演练、断网退回、跨标签交错、首次失败、UNSUPPORTED
+npm run test       # Vitest：完整/摘要复用、取消/断网/校验/配额/中断重开/迟到代次/升级回收/退回边界/锁定演练
+npm run e2e        # Playwright：复用安装、中断安装与离线重载、离线演练、断网退回、跨标签交错、首次失败、锁定演练、UNSUPPORTED
 npm run verify     # 类型检查 + 单测 + 构建 + Playwright，一键全量验收
 ```
 
@@ -96,7 +103,7 @@ docker compose up --build verify
 3. 或分别清理：
    - **Service Workers** → 对本站点 **Unregister**；
    - **Cache Storage** → 删除 `shell:*`（应用壳）与所有 `manual:*`（手册代际/暂存）；
-   - **IndexedDB** → 删除 `manual-kiosk-db`（仅含当前/上一版代际指针与安装状态）。
+   - **IndexedDB** → 删除 `manual-kiosk-db`（仅含当前/上一版代际指针、安装状态与锁定演练绑定）。
 4. **硬刷新**：Windows/Linux `Ctrl+Shift+R`，macOS `Cmd+Shift+R`。
 
 ### 2. 命令行（无头 / 自动化环境）
@@ -126,6 +133,9 @@ docker compose up -d --build web
 > 任何暂存/半包或迟到代次缓存对外都不可见，因此清缓存或异常中断都不会让半包顶替旧手册。
 > 新代际缓存复制了自己所需的全部字节；成功安装后最多保留当前版与紧邻上一版两个手册缓存，
 > Service Worker 只读取当前激活指针，退回时一次性交换当前/上一版指针。
+> **锁定演练期间**，锁定代际缓存即使既不是当前版也（在一次安装后）成为“上一版”，也会被显式保留：
+> 普通读取走当前激活指针，演练请求携带 `x-manual-drill-cache` 头由 SW 校验后只从锁定缓存出
+> （未命中直接失败，绝不回退网络/激活缓存）；需要第三份缓存的安装/退回在协调器与 IDB CAS 两层被拒绝。
 
 ## 安装状态机（速查）
 
@@ -145,4 +155,14 @@ idle ──复核上一版──▶ rollback-reviewing ──确认──▶ rol
           ├─ 缓存缺失 ─▶ failed(missing)
           └─ 资源/整单摘要失败 ─▶ failed(checksum)
 （任何退回失败都不清理当前版或上一版缓存，当前可用版本继续可读）
+
+锁定演练（可选，默认不勾选）：
+idle ──勾选“锁定本次演练版本”并开始──▶ drill-locked（IDB 固定 version/cacheName/generation/条目）
+        │
+        ├─ 安装另一版本（仅当尚无“上一版”）─▶ activated：普通指针切新版，锁定缓存成为上一版且继续保留，绑定不变
+        │      └─ 此后再装任意版本 / 退回 ─▶ failed(locked)：明确拒绝，不创建第三份缓存、不删除锁定资源
+        ├─ 勾选动作/通过结论 ─▶ 每步持久化到 IDB（刷新后恢复进度、条目与通过记录）
+        ├─ 刷新/重开 ─▶ 从 IDB 恢复会话与版本绑定；锁定缓存缺失才释放绑定
+        └─ 完成或取消 ─▶ drillLock 清空，恢复“最多当前+上一版”的正常安装/回收语义
+（未选择锁定时：切换或退回版本即终止未完成演练，旧结论失效——与既有语义一致）
 ```
